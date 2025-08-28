@@ -22,3 +22,7 @@ EXPOSE 8080
 
 # Старт
 CMD ["python", "bot.py"]
+
+# Use compressed bot
+COPY bot_compress.py .
+CMD ["python", "bot_compress.py"]

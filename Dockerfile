@@ -26,3 +26,6 @@ CMD ["python", "bot.py"]
 # Use compressed bot
 COPY bot_compress.py .
 CMD ["python", "bot_compress.py"]
+# Use dynamic compression bot
+COPY bot_dynamic.py .
+CMD ["python", "bot_dynamic.py"]

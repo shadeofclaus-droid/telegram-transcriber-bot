@@ -29,3 +29,6 @@ CMD ["python", "bot_compress.py"]
 # Use dynamic compression bot
 COPY bot_dynamic.py .
 CMD ["python", "bot_dynamic.py"]
+# Override with dynamic uppercase
+COPY bot_dynamic.py .
+CMD ["python", "bot_dynamic.py"]

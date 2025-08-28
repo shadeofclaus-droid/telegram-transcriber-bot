@@ -63,24 +63,17 @@ def transcribe_wav(path_wav: Path, language: str | None = None) -> str:
 
 async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привіт! Надішли voice / audio / відео або файл з аудіо — поверну текст.
-"
+        "Привіт! Надішли voice / audio / відео або файл з аудіо — поверну текст.\n"
         "Можна додати підпис: lang=uk або lang=en."
     )
 
 async def help_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "/start — привітання
-"
-        "/help — як користуватися
-"
-        "/ping — перевірка доступності
-"
-        "/privacy — політика приватності (коротко)
-
-"
-        "Надішли аудіо/voice/відео/файл — отримаєш розшифровку.
-"
+        "/start — привітання\n"
+        "/help — як користуватися\n"
+        "/ping — перевірка доступності\n"
+        "/privacy — політика приватності (коротко)\n\n"
+        "Надішли аудіо/voice/відео/файл — отримаєш розшифровку.\n"
         "Порада: додай підпис lang=uk або lang=en."
     )
 
@@ -89,8 +82,7 @@ async def ping(update: Update, _: ContextTypes.DEFAULT_TYPE):
 
 async def privacy(update: Update, _: ContextTypes.DEFAULT_TYPE):
     txt = (
-        "<b>Приватність</b>
-"
+        "<b>Приватність</b>\n"
         "Файли зберігаються тимчасово лише для конвертації й видаляються одразу після транскрипції. "
         "Текст відповіді надсилається в цей чат і ніде більше не публікується."
     )

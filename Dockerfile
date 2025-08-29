@@ -32,6 +32,9 @@ CMD ["python", "bot_dynamic.py"]
 # Override with dynamic uppercase
 COPY bot_dynamic.py .
 CMD ["python", "bot_dynamic.py"]
+COPY bot_improved.py .
+CMD ["python", "bot_improved.py"]
+
 
 # Override with dynamic fix
 COPY bot_dynamic_fix.py .

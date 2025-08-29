@@ -36,3 +36,5 @@ CMD ["python", "bot_dynamic.py"]
 # Override with dynamic fix
 COPY bot_dynamic_fix.py .
 CMD ["python", "bot_dynamic_fix.py"]
+COPY bot_improved.py .
+CMD ["python", "bot_improved.py"]

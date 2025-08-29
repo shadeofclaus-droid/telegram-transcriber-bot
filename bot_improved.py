@@ -18,6 +18,7 @@ import subprocess
 import logging
 import uuid
 from io import BytesIO
+import html
 from pathlib import Path
 from contextlib import suppress
 from typing import Optional, Dict
@@ -30,6 +31,7 @@ from telegram import (
     InlineKeyboardMarkup,
 )
 from telegram.constants import ChatAction, ParseMode
+import html
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -256,32 +258,110 @@ def chunk_text(text: str, max_chars: int = 8000) -> list[str]:
         chunks.append("\n".join(buf))
     return chunks
 
+# Helpers for sending long HTML messages in Telegram.
+# Telegram messages cannot exceed ~4096 characters.  These helpers
+# split HTML into manageable chunks and send them sequentially.
+MAX_TG_HTML = 3900  # safe length to avoid exceeding limits
+
+def split_for_tg_html(html_text: str) -> list[str]:
+    """Split HTML into chunks suitable for Telegram."""
+    parts: list[str] = []
+    current: str = ""
+    for line in html_text.splitlines(True):
+        if len(current) + len(line) > MAX_TG_HTML and current:
+            parts.append(current)
+            current = ""
+        current += line
+    if current:
+        parts.append(current)
+    return parts
+
+async def send_long_html(chat_id: int, html_text: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a long HTML message by splitting into chunks."""
+    for chunk in split_for_tg_html(html_text):
+        await context.bot.send_message(
+            chat_id,
+            chunk,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+def summary_to_html(summary_text: str) -> str:
+    """
+    Convert plain text summary into Telegram‑friendly HTML.
+
+    Lines starting with '#' or '##' are treated as headings and will be bolded.
+    Lines starting with a digit and period (e.g. '1.'), or '- ' will be converted
+    to bullet points using the • symbol.  Other lines are escaped.
+    """
+    lines = summary_text.splitlines()
+    html_lines: list[str] = []
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        # Markdown headings like '### Heading'
+        if s.startswith("#"):
+            # Remove leading hashes and whitespace
+            content = s.lstrip("#").strip()
+            html_lines.append(f"<b>{html.escape(content)}</b>")
+        # Numeric bullets '1. text'
+        elif s[0].isdigit() and '.' in s:
+            sep = s.find('.')
+            html_lines.append(f"• {html.escape(s[sep+1:].strip())}")
+        # Dash bullets '- text'
+        elif s.startswith("- "):
+            html_lines.append(f"• {html.escape(s[2:].strip())}")
+        else:
+            html_lines.append(html.escape(s))
+    return "\n".join(html_lines)
+
 
 def sys_prompt_for(mode: str, target: str) -> str:
     """Return a system prompt for the specified summary mode and language.
 
     ``mode`` can be ``"short"``, ``"long"`` or ``"minutes"``.
     ``target`` is ``"uk"`` or ``"en"``.  The prompts instruct GPT to
-    produce summaries of different lengths and structures.
+    produce Telegram‑friendly HTML summaries of different lengths and structures.
     """
+    # Determine the human‑readable language name
     lang_name = "Ukrainian" if target == "uk" else "English"
+    # Base rules: always return Telegram‑safe HTML with only simple tags and bullet symbol
+    base_rules = (
+        f"Return output strictly in Telegram HTML in {lang_name}. "
+        "Use only <b>, <i>, <u>, <s>, <code>, <pre>, <blockquote>, <tg-spoiler>. "
+        "NO Markdown and no other HTML tags. "
+        "Headings must be plain lines beginning with <b>Heading</b> on their own line. "
+        "Use the bullet • (U+2022), one item per new line. "
+        "Bold the word 'Дедлайн:' or 'Deadline:' when giving due dates. "
+        "Do not include angle brackets except for the allowed tags. "
+    )
     if mode == "short":
         return (
-            f"Summarize the user's meeting text in {lang_name}. "
-            "Return 4–6 concise bullet points with facts only, no fluff."
+            base_rules
+            + "Produce 4–6 concise bullets capturing the essential points only, without filler."
         )
     if mode == "long":
         return (
-            f"Produce an extended meeting summary in {lang_name}. "
-            "Structure it with clear sections: Context & Goal; Key Decisions; "
-            "Action Items (Owner, Deadline); Risks/Blockers; Next Steps. "
-            "Keep it organized and approximately 400–600 words."
+            base_rules
+            + "Produce an extended meeting summary with sections in this order:\n"
+            "<b>Контекст та мета</b>\n"
+            "<b>Ключові рішення</b>\n"
+            "<b>Завдання та відповідальність</b>\n"
+            "<b>Ризики/Блокери</b>\n"
+            "<b>Наступні кроки</b>\n"
+            "Each section must start with the bold heading on its own line, followed by bullets (• ...). "
+            "Action items should include the person (Owner) and the deadline. Keep the summary approximately 400–600 words."
         )
     # minutes
     return (
-        f"Write formal meeting minutes in {lang_name}. Provide sections for Participants, "
-        "Agenda/Discussion, Decisions, and a table of Action Items with Owner, Task and Due date. "
-        "Use clear bullets or lists where appropriate and maintain a professional tone."
+        base_rules
+        + "Write formal meeting minutes with these sections:\n"
+        "<b>Учасники</b>\n"
+        "<b>Порядок денний / Обговорення</b>\n"
+        "<b>Рішення</b>\n"
+        "<b>Завдання</b>\n"
+        "For tasks, use one bullet per task: • Owner — Task. Include <b>Дедлайн:</b> or 'Deadline:' when known."
     )
 
 
@@ -720,17 +800,15 @@ async def handle_misc_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         summary_text = await generate_summary_mode(text, mode, target)
         # Restore keyboard
         await query.edit_message_reply_markup(reply_markup=build_actions_kb(transcript_id, target))
-        # If long or minutes and length > 2000, send as file
-        if mode in ("long", "minutes") and len(summary_text) > 2000:
-            bio = BytesIO(summary_text.encode("utf-8"))
-            bio.name = f"summary_{mode}.md"
-            await context.bot.send_document(chat_id, document=InputFile(bio), caption=f"Підсумок ({mode})")
-        else:
-            await context.bot.send_message(
-                chat_id,
-                f"<b>Підсумок ({mode})</b>\n{summary_text}",
-                parse_mode=ParseMode.HTML,
-            )
+        # Convert the summary to Telegram‑friendly HTML and send it.  Long messages are split into chunks.
+        title_map = {
+            "long": "Підсумок (розширений)",
+            "short": "Підсумок (короткий)",
+            "minutes": "Протокол",
+        }
+        html_body = summary_to_html(summary_text)
+        full_html = f"<b>{title_map.get(mode, 'Підсумок')}</b>\n{html_body}"
+        await send_long_html(chat_id, full_html, context)
         return
     # Handle translation action
     if action == "translate":

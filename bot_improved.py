@@ -44,10 +44,10 @@ from openai import OpenAI
 # ---------- configuration ----------
 # Maximum original file size the bot will accept (in bytes).  Files larger
 # than this will be rejected before attempting conversion.
-MAX_FILE_BYTES = 200 * 1024 * 1024  # 200 MB
+MAX_FILE_BYTES = 200 * 1024 * 1024  # 200 MB
 # Maximum size of audio to send to the OpenAI API (in bytes).  The bot
 # compresses audio progressively until it fits this limit.
-MAX_API_FILE_BYTES = 25 * 1024 * 1024  # 25 MB
+MAX_API_FILE_BYTES = 25 * 1024 * 1024  # 25 MB
 # Sample rate for conversion.
 TARGET_SR = 16_000
 # Bitrate ladder for progressive compression.  Lower values produce
@@ -137,26 +137,44 @@ async def transcribe_audio(path_audio: Path, language: Optional[str] = None) -> 
     return response.text or ""
 
 
-async def generate_summary(text: str) -> str:
-    """Generate a short summary of the given text using OpenAI Chat API.
+async def generate_summary(text: str, language: str = "uk") -> str:
+    """Generate a short summary of the given text using the OpenAI Chat API.
 
-    The summary is kept concise and uses 2–3 sentences.
+    Parameters
+    ----------
+    text : str
+        The transcript to summarise.
+    language : str
+        Target language code for the summary ("uk" or "en").  Defaults to "uk".
+
+    Returns
+    -------
+    str
+        A concise summary of the transcript in the target language.  If an error
+        occurs, returns an error message in Ukrainian.
     """
-    # Guard against extremely long texts by truncating
+    # Guard against extremely long texts by truncating the input to avoid
+    # excessive API costs.  The whisper transcripts may be very long.
     max_chars = 8000
     snippet = text[:max_chars]
+    # Build a system prompt instructing the assistant to summarise in the
+    # desired language.  We keep the summary to 2–3 sentences and ask for
+    # bullet points only when appropriate.
+    if language.lower().startswith("uk"):
+        system_prompt = (
+            "You are a helpful assistant that summarises transcripts into a concise "
+            "overview in Ukrainian. Provide the key points in a short form, using 2–3 sentences."
+        )
+    else:
+        system_prompt = (
+            "You are a helpful assistant that summarises transcripts into a concise "
+            "overview in English. Provide the key points in a short form, using 2–3 sentences."
+        )
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a helpful assistant that summarizes transcripts into a concise summary. "
-                "Provide a short overview of the key points in 2–3 sentences."
-            ),
-        },
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": snippet},
     ]
     try:
-        # Use a smaller model to reduce latency and cost
         response = await asyncio.to_thread(
             client.chat.completions.create,
             model="gpt-3.5-turbo",
@@ -201,6 +219,95 @@ async def translate_text(text: str, target_language: str) -> str:
         log.exception("Translation failed: %s", exc)
         translation = "Не вдалося перекласти текст."
     return translation
+
+# ---------------------------------------------------------------------------
+# Inline keyboard helpers for post‑transcription actions
+
+def build_actions_kb(transcript_id: str, lang_hint: str) -> InlineKeyboardMarkup:
+    """Construct inline buttons for summary, translation and TXT export.
+
+    Parameters
+    ----------
+    transcript_id : str
+        Identifier for the stored transcript in chat_data.
+    lang_hint : str
+        A two‑letter language code ("uk" or "en") hint for the summary.  The
+        translation target will be the opposite language.
+
+    Returns
+    -------
+    InlineKeyboardMarkup
+        An inline keyboard with three buttons: summary, translation and TXT.
+    """
+    # Determine translation target: the opposite language
+    target = "en" if lang_hint.lower().startswith("uk") else "uk"
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"Підсумок ({lang_hint})", callback_data=f"summary:{transcript_id}:{lang_hint}"
+                ),
+                InlineKeyboardButton(
+                    f"Переклад → {target}", callback_data=f"translate:{transcript_id}:{target}"
+                ),
+            ],
+            [InlineKeyboardButton("TXT", callback_data=f"txt:{transcript_id}")],
+        ]
+    )
+
+
+def build_loading_kb(action: str) -> InlineKeyboardMarkup:
+    """Return a temporary keyboard showing a loading indicator for a given action.
+
+    The button is disabled (callback data is 'noop') and shows a spinner and the
+    name of the action. Supported actions: 'summary', 'translate', 'txt'.
+    """
+    labels = {
+        "summary": "⏳ Підсумок…",
+        "translate": "⏳ Переклад…",
+        "txt": "⏳ TXT…",
+    }
+    label = labels.get(action, "⏳ Обробка…")
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, callback_data="noop")]]
+    )
+
+
+async def set_actions_loading(query, action: str) -> None:
+    """Edit the reply markup of the message to show a loading indicator.
+
+    Parameters
+    ----------
+    query : telegram.CallbackQuery
+        The callback query associated with the button press.
+    action : str
+        The action being performed ('summary', 'translate', 'txt').
+    """
+    try:
+        await query.edit_message_reply_markup(reply_markup=build_loading_kb(action))
+    except Exception:
+        # If editing fails (e.g. message deleted), ignore
+        pass
+
+
+async def restore_actions_kb(query, transcript_id: str, lang_hint: str) -> None:
+    """Restore the normal inline keyboard after an action completes.
+
+    Parameters
+    ----------
+    query : telegram.CallbackQuery
+        The callback query associated with the button press.
+    transcript_id : str
+        Identifier for the stored transcript.
+    lang_hint : str
+        Language hint for the summary ("uk" or "en").
+    """
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=build_actions_kb(transcript_id, lang_hint)
+        )
+    except Exception:
+        pass
 
 
 def get_default_settings() -> Dict[str, str]:
@@ -365,42 +472,88 @@ async def handle_misc_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if not query or not query.data:
         return
     data = query.data
-    await query.answer()
-    # Data format: action:id[:lang]
+    # Parse the callback data.  Format: action:transcript_id[:lang]
     try:
         parts = data.split(":")
         action = parts[0]
         transcript_id = parts[1] if len(parts) > 1 else None
+        lang_hint = parts[2] if len(parts) > 2 else None
     except Exception:
         return
+    # If this is a no‑op button, just acknowledge and return
+    if action == "noop":
+        await query.answer("Обробка…", show_alert=False)
+        return
+    # Retrieve the transcript text
     transcripts: Dict[str, str] = context.chat_data.get("transcripts", {})
     text = transcripts.get(transcript_id)
     if not text:
-        await query.message.reply_text("Вибачте, не знайдено текст.")
+        await query.answer("Текст не знайдено", show_alert=True)
         return
-    # Handle summary
+    # Determine a sensible language hint if not provided
+    if not lang_hint:
+        # Use stored last_transcript_lang if available
+        lang_hint = context.chat_data.get("last_transcript_lang", "uk")
+    # Handle summary action
     if action == "summary":
-        summary = await generate_summary(text)
-        await query.message.reply_text(summary)
+        # Provide immediate feedback and show loading spinner
+        await query.answer("Готую підсумок…", show_alert=False)
+        chat_id = query.message.chat_id
+        # Show typing indicator
+        with suppress(Exception):
+            await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+        # Replace buttons with loading state
+        await set_actions_loading(query, "summary")
+        # Generate summary in the requested language
+        summary_text = await generate_summary(text, lang_hint)
+        # Restore original keyboard with hints
+        await restore_actions_kb(query, transcript_id, lang_hint)
+        # Send the summary to the chat
+        await context.bot.send_message(
+            chat_id,
+            f"<b>Підсумок ({lang_hint})</b>\n{summary_text}",
+            parse_mode=ParseMode.HTML,
+        )
         return
-    # Handle translation
+    # Handle translation action
     if action == "translate":
-        # Determine target language: if current setting is uk → en, else uk
-        settings = context.chat_data.get("settings", get_default_settings())
-        src_lang = settings.get("language", "auto")
-        # If source language is auto, guess based on first few characters: assume if contains cyrillic then uk else en
-        guessed = "uk" if any("а" <= c.lower() <= "я" for c in text[:200]) else "en"
-        target = "en" if guessed == "uk" else "uk"
-        translation = await translate_text(text, target)
-        await query.message.reply_text(translation)
+        # Parse the target language from callback data (e.g. translate:id:en)
+        target = lang_hint or "en"
+        await query.answer("Готую переклад…", show_alert=False)
+        chat_id = query.message.chat_id
+        with suppress(Exception):
+            await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+        await set_actions_loading(query, "translate")
+        translation_text = await translate_text(text, target)
+        # Determine summary language hint for restoring keyboard.  The summary
+        # language is the opposite of the translation target.
+        new_lang_hint = "uk" if target.lower().startswith("en") else "en"
+        await restore_actions_kb(query, transcript_id, new_lang_hint)
+        await context.bot.send_message(
+            chat_id,
+            f"<b>Переклад ({target})</b>\n{translation_text}",
+            parse_mode=ParseMode.HTML,
+        )
         return
     # Handle TXT download
     if action == "txt":
+        await query.answer("Готую файл…", show_alert=False)
+        chat_id = query.message.chat_id
+        # Show document upload indicator
+        with suppress(Exception):
+            await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
+        await set_actions_loading(query, "txt")
         bio = BytesIO(text.encode("utf-8"))
         bio.name = "transcript.txt"
-        await query.message.reply_document(document=InputFile(bio), caption="transcript.txt")
+        await query.message.reply_document(
+            document=InputFile(bio), caption="transcript.txt"
+        )
+        # Restore keyboard; lang_hint from stored last transcript
+        stored_lang_hint = context.chat_data.get("last_transcript_lang", "uk")
+        await restore_actions_kb(query, transcript_id, stored_lang_hint)
         return
-    # Fallback: ignore
+    # Fallback: acknowledge unknown actions
+    await query.answer()
 
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -412,7 +565,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Send immediate feedback to show processing has started
     with suppress(Exception):
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        status_msg = await msg.reply_text("Прийняв 🎧 Обробляю…", quote=True)
+        status_msg = await msg.reply_text("Прийняв 🌟 Обробляю…", quote=True)
     file = None
     filename = "input"
     try:
@@ -486,7 +639,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 break
         if not success:
             await msg.reply_text(
-                "Аудіо занадто довге або не вдається стиснути до допустимого розміру (25 МБ). "
+                "Аудіо занадто довге або не вдається стиснути до допустимого розміру (25 МБ). "
                 "Спробуйте надіслати коротший або більш стиснутий файл."
             )
             return
@@ -510,6 +663,19 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         transcript_id = uuid.uuid4().hex
         transcripts[transcript_id] = text
         context.chat_data["transcripts"] = transcripts
+        # Persist the last transcript text and language for summary/translation hints
+        # Determine the language of the transcript: use explicit language if set,
+        # otherwise guess based on presence of Cyrillic characters in the text.
+        if language:
+            transcript_lang = language.lower()
+        else:
+            transcript_lang = (
+                "uk"
+                if any("а" <= c.lower() <= "я" for c in text[:200])
+                else "en"
+            )
+        context.chat_data["last_transcript_text"] = text
+        context.chat_data["last_transcript_lang"] = transcript_lang
         # Determine output preference
         output_pref = settings.get("output", "auto")
         # Determine if file output is needed
@@ -521,20 +687,17 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         else:
             # auto: if text too long use file
             use_file = len(text) > 3500
-        # Prepare buttons for post actions
-        buttons = [
-            [
-                InlineKeyboardButton("Підсумок", callback_data=f"summary:{transcript_id}"),
-                InlineKeyboardButton("Переклад", callback_data=f"translate:{transcript_id}"),
-            ],
-            [InlineKeyboardButton("TXT", callback_data=f"txt:{transcript_id}")],
-        ]
-        reply_markup = InlineKeyboardMarkup(buttons)
+        # Compute summary language hint for buttons (use transcript language)
+        lang_hint = "uk" if transcript_lang.startswith("uk") else "en"
+        # Build inline keyboard with hints
+        reply_markup = build_actions_kb(transcript_id, lang_hint)
         if use_file:
             bio = BytesIO(text.encode("utf-8"))
             bio.name = "transcript.txt"
             caption = "Розшифровка"
-            await msg.reply_document(document=InputFile(bio), caption=caption, reply_markup=reply_markup)
+            await msg.reply_document(
+                document=InputFile(bio), caption=caption, reply_markup=reply_markup
+            )
         else:
             await msg.reply_text(text, reply_markup=reply_markup)
         # Delete status message if it exists

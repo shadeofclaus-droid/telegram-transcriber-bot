@@ -14,16 +14,16 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Код бота
+# Копіюємо всі варіанти скриптів у контейнер на випадок потреби
 COPY bot.py .
-
-COPY bot_improved.py .
-COPY bot_compress.py . 
-COPY bot_dynamic.py . 
+COPY bot_compress.py .
+COPY bot_dynamic.py .
 COPY bot_dynamic_fix.py .
+COPY bot_improved.py .
 COPY .env .env
 
 # Порт (не обов'язково для Telegram ботів, але інколи вимагає платформа)
 EXPOSE 8080
 
-# Встановити основну команду запуску бота
+# Запускаємо покращену версію бота
 CMD python bot_improved.py

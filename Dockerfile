@@ -15,29 +15,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Код бота
 COPY bot.py .
+COPY bot_improved.py .  # Додано копіювання bot_improved.py
+COPY bot_compress.py . 
+COPY bot_dynamic.py . 
+COPY bot_dynamic_fix.py .
 COPY .env .env
 
 # Порт (не обов'язково для Telegram ботів, але інколи вимагає платформа)
 EXPOSE 8080
 
-# Старт
-CMD ["python", "bot.py"]
-
-# Use compressed bot
-COPY bot_compress.py .
-CMD ["python", "bot_compress.py"]
-# Use dynamic compression bot
-COPY bot_dynamic.py .
-CMD ["python", "bot_dynamic.py"]
-# Override with dynamic uppercase
-COPY bot_dynamic.py .
-CMD ["python", "bot_dynamic.py"]
-COPY bot_improved.py .
-CMD ["python", "bot_improved.py"] 
-
-
-# Override with dynamic fix
-COPY bot_dynamic_fix.py .
-CMD ["python", "bot_dynamic_fix.py"]
-COPY bot_improved.py .
-CMD ["python", "bot_improved.py"]
+# Встановити основну команду запуску бота
+CMD ["python", "bot_improved.py"]  # Замість декількох CMD використовуйте одну

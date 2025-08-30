@@ -15,7 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Код бота
 COPY bot.py .
-CMD ["python", "bot_improved.py"]
+
+COPY bot_improved.py .
 COPY bot_compress.py . 
 COPY bot_dynamic.py . 
 COPY bot_dynamic_fix.py .

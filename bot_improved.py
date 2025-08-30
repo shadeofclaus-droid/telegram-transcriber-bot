@@ -70,4 +70,4 @@ def process_file(file_path):
     print(f"Обробка файлу {file_path} завершена за {time.time() - start_time:.2f} секунд")
 
 # Викликаємо обробку файлу
-process_large_file('/mnt/data/bot_improved.py')
+#pr#ocess_large_file('/mnt/data/bot_improved.py')

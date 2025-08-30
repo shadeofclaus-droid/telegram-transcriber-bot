@@ -26,4 +26,4 @@ COPY .env .env
 EXPOSE 8080
 
 # Встановити основну команду запуску бота
-CMD ["python", "bot_improved.py"]  # Замість декількох CMD використовуйте одну
+CMD python bot_improved.py

@@ -1,1066 +1,656 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Improved Telegram transcription bot with progressive audio compression,
-inline settings, and post‑transcription actions such as summary, translation
-and text export.  The bot responds to voice/audio/video/file messages,
-compresses audio to stay within Whisper API limits, calls OpenAI
-transcription, and returns either a chat message or a file with
-interactive buttons for further actions.  User preferences for language
-and output format are stored per chat via ``context.chat_data``.
-
-Note: Summary and translation are implemented via OpenAI's Chat
-Completions API.  Ensure your API key has sufficient quota.
+Telegram Transcriber Bot — improved:
+- Progressive audio conversion/compression to stay under OpenAI upload limit
+- Verbose transcription with word/segment timestamps when available
+- Summary modes: short / long / minutes (meeting protocol), language-aware
+- Telegram-safe HTML output + chunking for long messages
+- Subtitles (SRT) generation from word-level timestamps with words-per-cue selection
+- Inline UI with loading states; simple /settings
 """
 
 import asyncio
 import os
 import tempfile
 import subprocess
-import logging
 import uuid
-from io import BytesIO
-import html
+from dataclasses import dataclass
 from pathlib import Path
-from contextlib import suppress
-from typing import Optional, Dict
+from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 from telegram import (
-    Update,
-    InputFile,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    InputFile
 )
 from telegram.constants import ChatAction, ParseMode
-import html
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from openai import OpenAI
 
-
-# ---------- configuration ----------
-# Maximum original file size the bot will accept (in bytes).  Files larger
-# than this will be rejected before attempting conversion.
-MAX_FILE_BYTES = 200 * 1024 * 1024  # 200 MB
-# Maximum size of audio to send to the OpenAI API (in bytes).  The bot
-# compresses audio progressively until it fits this limit.
-MAX_API_FILE_BYTES = 25 * 1024 * 1024  # 25 MB
-# Sample rate for conversion.
-TARGET_SR = 16_000
-# Bitrate ladder for progressive compression.  Lower values produce
-# smaller files at the cost of quality.
-BITRATE_LADDER = ["64k", "32k", "16k", "8k"]
-# ---------------------------
-
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-log = logging.getLogger("transcriber_improved")
-
-# Load environment variables for API keys
+# -----------------------------------------------------------------------------
+# ENV
+# -----------------------------------------------------------------------------
 load_dotenv()
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN env var.")
 if not OPENAI_API_KEY:
     raise RuntimeError("Set OPENAI_API_KEY env var.")
-
-# Initialize OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# -----------------------------------------------------------------------------
+# Limits / constants
+# -----------------------------------------------------------------------------
+MAX_API_FILE_BYTES = 25 * 1024 * 1024  # OpenAI limit ~25MB
+AUDIO_SR = 16000
+TMP_WAV = "converted.wav"
+TMP_OGG = "converted.ogg"
 
-def run_ffmpeg_to_mp3(src: Path, dst: Path, sr: int = TARGET_SR, bitrate: str = "64k") -> None:
-    """Convert any audio/video file to mono MP3 at the given sample rate and bitrate.
+# Telegram message safe length for HTML (leave headroom for tags)
+MAX_TG_HTML = 3900
 
-    Uses ``ffmpeg`` command line.  Raises ``subprocess.CalledProcessError`` if
-    conversion fails.
-    """
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(src),
-        "-vn",
-        "-acodec",
-        "libmp3lame",
-        "-ac",
-        "1",
-        "-b:a",
-        bitrate,
-        "-ar",
-        str(sr),
-        str(dst),
-    ]
-    log.info("FFmpeg: %s", " ".join(cmd))
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+# -----------------------------------------------------------------------------
+# Simple settings model
+# -----------------------------------------------------------------------------
+DEFAULT_SETTINGS = {
+    "summary_lang": "auto",       # auto / uk / en
+    "translate_target": "uk",     # uk / en (reserved for future use)
+    "summary_mode": "short",      # short / long / minutes
+    "output": "auto",             # auto / text / file (reserved)
+}
 
-
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
 def human_size(n: int) -> str:
-    """Return human readable file size."""
-    units = ["B", "KB", "MB", "GB", "TB"]
+    units = ["B","KB","MB","GB","TB"]
     i = 0
     f = float(n)
-    while f >= 1024 and i < len(units) - 1:
+    while f >= 1024 and i < len(units)-1:
         f /= 1024.0
         i += 1
     return f"{f:.1f}{units[i]}"
 
+def pick_output_lang(transcript_lang: Optional[str], settings: Dict, fallback="uk") -> str:
+    pref = (settings or {}).get("summary_lang", "auto")
+    if pref != "auto":
+        return pref
+    if transcript_lang:
+        t = transcript_lang.lower()
+        if t.startswith("uk"):
+            return "uk"
+        if t.startswith("en"):
+            return "en"
+    return fallback
 
-async def transcribe_audio(path_audio: Path, language: Optional[str] = None) -> str:
-    """Call OpenAI Whisper API to transcribe the given audio file.
+# -----------------------------------------------------------------------------
+# FFmpeg helpers
+# -----------------------------------------------------------------------------
+def run_ffmpeg_to_wav(src: Path, dst: Path, sr=AUDIO_SR):
+    cmd = [
+        "ffmpeg", "-y", "-i", str(src),
+        "-vn", "-ac", "1", "-ar", str(sr),
+        "-acodec", "pcm_s16le",
+        str(dst)
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    Parameters
-    ----------
-    path_audio: Path
-        Path to audio file (must be <= MAX_API_FILE_BYTES).
-    language: str | None
-        Optional language code (e.g. "uk", "en").  If None, auto‑detect.
-    Returns
-    -------
-    str
-        Transcribed text.
+def run_ffmpeg_to_ogg(src: Path, dst: Path, bitrate_kbps: int = 32, sr=AUDIO_SR):
+    # Opus in OGG container; very small while speech quality is fine at 16–32 kbps mono
+    cmd = [
+        "ffmpeg", "-y", "-i", str(src),
+        "-vn", "-ac", "1", "-ar", str(sr),
+        "-c:a", "libopus", "-b:a", f"{bitrate_kbps}k",
+        str(dst)
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def ensure_under_limit(src: Path) -> Path:
     """
+    Try progressively smaller bitrates to get under OpenAI 25MB upload limit.
+    Returns path to OGG (Opus) that is under the limit, or original if already small.
+    """
+    if src.stat().st_size <= MAX_API_FILE_BYTES:
+        return src
+    # Convert to Opus with falling bitrate ladder
+    tmp = src
+    for kb in [64, 48, 32, 24, 16, 12, 8]:
+        ogg = src.with_suffix(".ogg")
+        try:
+            run_ffmpeg_to_ogg(tmp, ogg, bitrate_kbps=kb)
+        except subprocess.CalledProcessError:
+            continue
+        if ogg.stat().st_size <= MAX_API_FILE_BYTES:
+            return ogg
+        tmp = ogg
+    # Fallback return smallest we produced
+    return tmp
+
+# -----------------------------------------------------------------------------
+# Transcription
+# -----------------------------------------------------------------------------
+def transcribe_verbose(path_audio: Path, language: Optional[str] = None) -> Dict:
+    """
+    Return {'text': str, 'words': [{'start':s,'end':e,'word':w},...],
+            'segments': [{'start':s,'end':e,'text':t}, ...], 'lang': 'uk'|'en'|...}
+
+    Tries gpt-4o-mini-transcribe with word/segment timestamps first, falls back to whisper-1 verbose_json.
+    """
+    # 1) Try 4o-mini-transcribe with timestamps
+    try:
+        with open(path_audio, "rb") as f:
+            r = client.audio.transcriptions.create(
+                model="gpt-4o-mini-transcribe",
+                file=f,
+                language=language,
+                timestamp_granularities=["word", "segment"],
+            )
+        words = []
+        if getattr(r, "words", None):
+            for w in r.words:
+                words.append({"start": float(w.start), "end": float(w.end), "word": w.word})
+        segments = []
+        if getattr(r, "segments", None):
+            for s in r.segments:
+                segments.append({"start": float(s.start), "end": float(s.end), "text": s.text})
+        lang = getattr(r, "language", None) or None
+        return {"text": r.text, "words": words, "segments": segments, "lang": lang}
+    except Exception:
+        pass
+
+    # 2) Fall back to whisper-1 verbose_json
     with open(path_audio, "rb") as f:
-        # Whisper automatically detects language when language is None
-        response = client.audio.transcriptions.create(
+        r = client.audio.transcriptions.create(
             model="whisper-1",
             file=f,
             language=language,
+            response_format="verbose_json",
         )
-    return response.text or ""
-
-
-async def generate_summary(text: str, language: str = "uk") -> str:
-    """Generate a short summary of the given text using the OpenAI Chat API.
-
-    Parameters
-    ----------
-    text : str
-        The transcript to summarise.
-    language : str
-        Target language code for the summary ("uk" or "en").  Defaults to "uk".
-
-    Returns
-    -------
-    str
-        A concise summary of the transcript in the target language.  If an error
-        occurs, returns an error message in Ukrainian.
-    """
-    # Guard against extremely long texts by truncating the input to avoid
-    # excessive API costs.  The whisper transcripts may be very long.
-    max_chars = 8000
-    snippet = text[:max_chars]
-    # Build a system prompt instructing the assistant to summarise in the
-    # desired language.  We keep the summary to 2–3 sentences and ask for
-    # bullet points only when appropriate.
-    if language.lower().startswith("uk"):
-        system_prompt = (
-            "You are a helpful assistant that summarises transcripts into a concise "
-            "overview in Ukrainian. Provide the key points in a short form, using 2–3 sentences."
-        )
+    if isinstance(r, dict):
+        text = r.get("text", "")
+        segs = r.get("segments", []) or []
+        lang = r.get("language") or None
     else:
-        system_prompt = (
-            "You are a helpful assistant that summarises transcripts into a concise "
-            "overview in English. Provide the key points in a short form, using 2–3 sentences."
-        )
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": snippet},
-    ]
-    try:
-        response = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-3.5-turbo",
-            messages=messages,
-            max_tokens=256,
-            temperature=0.5,
-        )
-        summary = response.choices[0].message.content.strip()
-    except Exception as exc:
-        log.exception("Summary generation failed: %s", exc)
-        summary = "Не вдалося створити підсумок."
-    return summary
+        text = getattr(r, "text", "") or ""
+        segs = getattr(r, "segments", []) or []
+        lang = getattr(r, "language", None) or None
 
+    words = []
+    for seg in segs:
+        start = float(seg["start"])
+        end = float(seg["end"])
+        seg_text = (seg.get("text") or "").strip()
+        tokens = seg_text.split()
+        if not tokens:
+            continue
+        dur = max(0.001, end - start)
+        per = dur / len(tokens)
+        t = start
+        for w in tokens:
+            w_start = t
+            w_end = min(end, t + per)
+            words.append({"start": w_start, "end": w_end, "word": w})
+            t = w_end
+    segments = [{"start": float(s["start"]), "end": float(s["end"]), "text": s.get("text","")} for s in segs]
+    return {"text": text, "words": words, "segments": segments, "lang": lang}
 
-async def translate_text(text: str, target_language: str) -> str:
-    """Translate the given text to the target language using OpenAI Chat API.
-
-    Supported target languages: "uk" (Ukrainian), "en" (English).
-    """
-    assert target_language in {"uk", "en"}
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a professional translator. Translate the following text "
-                f"to {'Ukrainian' if target_language == 'uk' else 'English'}. "
-                "Keep names and numbers unchanged."
-            ),
-        },
-        {"role": "user", "content": text},
-    ]
-    try:
-        response = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-3.5-turbo",
-            messages=messages,
-            max_tokens=2000,
-            temperature=0.3,
-        )
-        translation = response.choices[0].message.content.strip()
-    except Exception as exc:
-        log.exception("Translation failed: %s", exc)
-        translation = "Не вдалося перекласти текст."
-    return translation
-
-# ---------------------------------------------------------------------------
-# Extended summarisation helpers
-
-def chunk_text(text: str, max_chars: int = 8000) -> list[str]:
-    """Split long text into chunks not exceeding ``max_chars`` characters.
-
-    The split is done on newline boundaries to avoid breaking sentences mid‑stream.
-
-    Parameters
-    ----------
-    text : str
-        The full transcript to be split.
-    max_chars : int, optional
-        Maximum number of characters per chunk.  Defaults to 8000.
-
-    Returns
-    -------
-    list[str]
-        A list of string chunks.
-    """
-    chunks: list[str] = []
-    buf: list[str] = []
-    total = 0
+# -----------------------------------------------------------------------------
+# Summarization helpers
+# -----------------------------------------------------------------------------
+def chunk_text(text: str, max_chars: int = 8000) -> List[str]:
+    chunks, cur, total = [], [], 0
     for para in text.split("\n"):
-        # Add +1 for the newline that will join them
-        if total + len(para) + 1 > max_chars and buf:
-            chunks.append("\n".join(buf))
-            buf = [para]
-            total = len(para) + 1
-        else:
-            buf.append(para)
-            total += len(para) + 1
-    if buf:
-        chunks.append("\n".join(buf))
+        if total + len(para) + 1 > max_chars and cur:
+            chunks.append("\n".join(cur)); cur = []; total = 0
+        cur.append(para); total += len(para) + 1
+    if cur: chunks.append("\n".join(cur))
     return chunks
 
-# Helpers for sending long HTML messages in Telegram.
-# Telegram messages cannot exceed ~4096 characters.  These helpers
-# split HTML into manageable chunks and send them sequentially.
-MAX_TG_HTML = 3900  # safe length to avoid exceeding limits
-
-def split_for_tg_html(html_text: str) -> list[str]:
-    """Split HTML into chunks suitable for Telegram."""
-    parts: list[str] = []
-    current: str = ""
-    for line in html_text.splitlines(True):
-        if len(current) + len(line) > MAX_TG_HTML and current:
-            parts.append(current)
-            current = ""
-        current += line
-    if current:
-        parts.append(current)
-    return parts
-
-async def send_long_html(chat_id: int, html_text: str, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a long HTML message by splitting into chunks."""
-    for chunk in split_for_tg_html(html_text):
-        await context.bot.send_message(
-            chat_id,
-            chunk,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-
-def summary_to_html(summary_text: str) -> str:
-    """
-    Convert plain text summary into Telegram‑friendly HTML.
-
-    Lines starting with '#' or '##' are treated as headings and will be bolded.
-    Lines starting with a digit and period (e.g. '1.'), or '- ' will be converted
-    to bullet points using the • symbol.  Other lines are escaped.
-    """
-    lines = summary_text.splitlines()
-    html_lines: list[str] = []
-    for line in lines:
-        s = line.strip()
-        if not s:
-            continue
-        # Markdown headings like '### Heading'
-        if s.startswith("#"):
-            # Remove leading hashes and whitespace
-            content = s.lstrip("#").strip()
-            html_lines.append(f"<b>{html.escape(content)}</b>")
-        # Numeric bullets '1. text'
-        elif s[0].isdigit() and '.' in s:
-            sep = s.find('.')
-            html_lines.append(f"• {html.escape(s[sep+1:].strip())}")
-        # Dash bullets '- text'
-        elif s.startswith("- "):
-            html_lines.append(f"• {html.escape(s[2:].strip())}")
-        else:
-            html_lines.append(html.escape(s))
-    return "\n".join(html_lines)
-
-
 def sys_prompt_for(mode: str, target: str) -> str:
-    """Return a system prompt for the specified summary mode and language.
-
-    ``mode`` can be ``"short"``, ``"long"`` or ``"minutes"``.
-    ``target`` is ``"uk"`` or ``"en"``.  The prompts instruct GPT to
-    produce Telegram‑friendly HTML summaries of different lengths and structures.
-    """
-    # Determine the human‑readable language name
     lang_name = "Ukrainian" if target == "uk" else "English"
-    # Base rules: always return Telegram‑safe HTML with only simple tags and bullet symbol
-    base_rules = (
+    base = (
         f"Return output strictly in Telegram HTML in {lang_name}. "
         "Use only <b>, <i>, <u>, <s>, <code>, <pre>, <blockquote>, <tg-spoiler>. "
-        "NO Markdown and no other HTML tags. "
-        "Headings must be plain lines beginning with <b>Heading</b> on their own line. "
+        "NO Markdown, no other tags. Headings must be '<b>Heading</b>' on its own line. "
         "Use the bullet • (U+2022), one item per new line. "
-        "Bold the word 'Дедлайн:' or 'Deadline:' when giving due dates. "
-        "Do not include angle brackets except for the allowed tags. "
+        "Bold the word 'Дедлайн:' or 'Deadline:' when present. Keep it paste-safe for Telegram."
     )
     if mode == "short":
-        return (
-            base_rules
-            + "Produce 4–6 concise bullets capturing the essential points only, without filler."
-        )
+        return base + " Produce 4–6 concise bullets with the key facts only."
     if mode == "long":
-        return (
-            base_rules
-            + "Produce an extended meeting summary with sections in this order:\n"
-            "<b>Контекст та мета</b>\n"
-            "<b>Ключові рішення</b>\n"
-            "<b>Завдання та відповідальність</b>\n"
-            "<b>Ризики/Блокери</b>\n"
-            "<b>Наступні кроки</b>\n"
-            "Each section must start with the bold heading on its own line, followed by bullets (• ...). "
-            "Action items should include the person (Owner) and the deadline. Keep the summary approximately 400–600 words."
+        return base + (
+            " Produce an extended meeting summary with sections in this order:\n"
+            "<b>Контекст та мета</b>\n<b>Ключові рішення</b>\n<b>Завдання та відповідальність</b>\n"
+            "<b>Ризики/Блокери</b>\n<b>Наступні кроки</b>\n"
+            "Each section must start with the bold heading line, followed by bullets (• ...). "
+            "Action items include Owner and <b>Дедлайн:</b> when present. Max ~600 words."
         )
     # minutes
-    return (
-        base_rules
-        + "Write formal meeting minutes with these sections:\n"
-        "<b>Учасники</b>\n"
-        "<b>Порядок денний / Обговорення</b>\n"
-        "<b>Рішення</b>\n"
-        "<b>Завдання</b>\n"
-        "For tasks, use one bullet per task: • Owner — Task. Include <b>Дедлайн:</b> or 'Deadline:' when known."
+    return base + (
+        " Write formal meeting minutes with sections "
+        "<b>Учасники</b>\n<b>Порядок денний / Обговорення</b>\n<b>Рішення</b>\n<b>Завдання</b>\n"
+        "For tasks use one bullet per task: • Owner — Task. <b>Дедлайн:</b> date if known."
     )
 
-
-async def generate_summary_mode(text: str, mode: str, target: str) -> str:
-    """Generate a summary in the specified mode and language using ChatGPT.
-
-    If the text is very long, it will be summarised in multiple chunks and
-    merged into a coherent final summary.  If any API call fails, returns
-    an error message in Ukrainian.
-
-    Parameters
-    ----------
-    text : str
-        The full transcript.
-    mode : str
-        One of ``"short"``, ``"long"`` or ``"minutes"``.
-    target : str
-        Target language code ("uk" or "en").
-
-    Returns
-    -------
-    str
-        The generated summary.
-    """
-    try:
-        # Split text into manageable chunks
-        chunks = chunk_text(text, max_chars=8000)
-        system_prompt = sys_prompt_for(mode, target)
-        # If single chunk, call directly
-        if len(chunks) == 1:
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": chunks[0]},
-            ]
-            response = await asyncio.to_thread(
-                client.chat.completions.create,
-                model="gpt-3.5-turbo",
-                messages=messages,
-                max_tokens=2048,
-                temperature=0.3,
-            )
-            return response.choices[0].message.content.strip()
-        # Otherwise summarise each chunk then summarise the summaries
-        partials = []
-        for c in chunks:
-            msgs = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": c},
-            ]
-            part_resp = await asyncio.to_thread(
-                client.chat.completions.create,
-                model="gpt-3.5-turbo",
-                messages=msgs,
-                max_tokens=1024,
-                temperature=0.3,
-            )
-            partials.append(part_resp.choices[0].message.content.strip())
-        # Merge partial summaries into a final summary
-        glue = "\n\n---\n\n".join(partials)
-        final_prompt = sys_prompt_for(mode, target)
-        merge_messages = [
-            {"role": "system", "content": final_prompt},
-            {
-                "role": "user",
-                "content": (
-                    "Combine these section summaries into one coherent summary:\n" + glue
-                ),
-            },
-        ]
-        final_resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-3.5-turbo",
-            messages=merge_messages,
-            max_tokens=2048,
-            temperature=0.3,
+async def generate_summary_mode(text: str, mode: str, target_lang: str) -> str:
+    chunks = chunk_text(text, max_chars=8000)
+    sys_msg = {"role": "system", "content": sys_prompt_for(mode, target_lang)}
+    if len(chunks) == 1:
+        res = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[sys_msg, {"role":"user","content":chunks[0]}],
+            temperature=0.2
         )
-        return final_resp.choices[0].message.content.strip()
-    except Exception as exc:
-        log.exception("Failed to generate summary (%s): %s", mode, exc)
-        return "Не вдалося створити підсумок."
+        return res.choices[0].message.content.strip()
+    # multi-pass
+    partials = []
+    for c in chunks:
+        res = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[sys_msg, {"role":"user","content":c}],
+            temperature=0.2
+        )
+        partials.append(res.choices[0].message.content.strip())
+    glue = "\n\n---\n\n".join(partials)
+    res2 = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[sys_msg, {"role":"user","content":f"Merge these sections into one coherent output:\n{glue}"}],
+        temperature=0.2
+    )
+    return res2.choices[0].message.content.strip()
 
-# ---------------------------------------------------------------------------
-# Inline keyboard helpers for post‑transcription actions
+# -----------------------------------------------------------------------------
+# Telegram HTML chunking / sending
+# -----------------------------------------------------------------------------
+def split_for_tg_html(html_text: str) -> List[str]:
+    parts, cur = [], ""
+    for line in html_text.splitlines(True):
+        if len(cur) + len(line) > MAX_TG_HTML and cur:
+            parts.append(cur); cur = ""
+        cur += line
+    if cur:
+        parts.append(cur)
+    return parts
 
-def build_actions_kb(transcript_id: str, lang_hint: str) -> InlineKeyboardMarkup:
-    """Construct inline buttons for post‑transcription actions.
+async def send_long_html(chat_id: int, html_text: str, context: ContextTypes.DEFAULT_TYPE):
+    for chunk in split_for_tg_html(html_text):
+        await context.bot.send_message(chat_id, chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
-    The keyboard includes options for a short summary, a long summary, meeting
-    minutes, translation and text export.  The translation target is inferred
-    as the opposite of ``lang_hint`` (uk ↔ en).
+# -----------------------------------------------------------------------------
+# Subtitles (SRT)
+# -----------------------------------------------------------------------------
+def _fmt_ts(sec: float) -> str:
+    if sec < 0: sec = 0
+    ms = int(round((sec - int(sec)) * 1000))
+    s = int(sec) % 60
+    m = (int(sec) // 60) % 60
+    h = int(sec) // 3600
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-    Parameters
-    ----------
-    transcript_id : str
-        Identifier for the stored transcript in ``chat_data``.
-    lang_hint : str
-        A two‑letter language code ("uk" or "en") used to label summary buttons
-        and infer the default translation direction.
+def make_srt_from_words(words: List[Dict], words_per_caption: int = 8) -> str:
+    cues = []
+    chunk = []
+    for w in words:
+        # glue punctuation to previous token
+        if w["word"] in {".", ",", "!", "?", ":", ";", "…"} and chunk:
+            chunk[-1]["word"] += w["word"]
+            chunk[-1]["end"] = w["end"]
+        else:
+            chunk.append(dict(w))
+        if len(chunk) >= words_per_caption:
+            cues.append(chunk)
+            chunk = []
+    if chunk:
+        cues.append(chunk)
 
-    Returns
-    -------
-    InlineKeyboardMarkup
-        An inline keyboard with three rows of buttons:
-        short/long summary, minutes/translation and file export.
-    """
-    # Determine translation target: the opposite of the hint language
-    target = "en" if lang_hint.lower().startswith("uk") else "uk"
+    lines = []
+    for i, c in enumerate(cues, 1):
+        start = c[0]["start"]
+        end = c[-1]["end"]
+        text = " ".join(w["word"] for w in c)
+        lines.append(str(i))
+        lines.append(f"{_fmt_ts(start)} --> {_fmt_ts(end)}")
+        lines.append(text)
+        lines.append("")
+    return "\n".join(lines)
+
+def build_subtitles_wpc_kb(transcript_id: str) -> InlineKeyboardMarkup:
+    opts = [4,6,8,10,12]
+    row = [InlineKeyboardButton(str(n), callback_data=f"subtitle_wpc:{n}:{transcript_id}") for n in opts]
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "Підсумок (короткий)", callback_data=f"summary:short:{transcript_id}"
-            ),
-            InlineKeyboardButton(
-                "Підсумок (розширений)", callback_data=f"summary:long:{transcript_id}"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "Протокол", callback_data=f"summary:minutes:{transcript_id}"
-            ),
-            InlineKeyboardButton(
-                f"Переклад → {target}", callback_data=f"translate:{target}:{transcript_id}"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "TXT", callback_data=f"txt:{transcript_id}"
-            )
-        ],
+        row,
+        [InlineKeyboardButton("Ввести число…", callback_data=f"subtitle_custom:{transcript_id}")],
     ])
 
+# -----------------------------------------------------------------------------
+# Keyboards for actions
+# -----------------------------------------------------------------------------
+def build_actions_kb(transcript_id: str, lang_hint: str) -> InlineKeyboardMarkup:
+    flip = "uk" if lang_hint == "en" else "en"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Підсумок (короткий)",  callback_data=f"summary:short:{transcript_id}"),
+            InlineKeyboardButton("Підсумок (розширений)", callback_data=f"summary:long:{transcript_id}"),
+        ],
+        [
+            InlineKeyboardButton("Протокол", callback_data=f"summary:minutes:{transcript_id}"),
+            InlineKeyboardButton(f"Переклад → {flip}", callback_data=f"translate:{flip}:{transcript_id}"),
+        ],
+        [
+            InlineKeyboardButton("TXT", callback_data=f"export_txt:{transcript_id}"),
+            InlineKeyboardButton("Субтитри", callback_data=f"subtitle:{transcript_id}"),
+        ]
+    ])
 
 def build_loading_kb(label: str = "Обробка…") -> InlineKeyboardMarkup:
-    """Return a temporary keyboard showing a loading indicator.
+    return InlineKeyboardMarkup([[InlineKeyboardButton(f"⏳ {label}", callback_data="noop")]])
 
-    A single disabled button is displayed with a spinner and the provided label.
-    """
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(f"⏳ {label}", callback_data="noop")]]
+# -----------------------------------------------------------------------------
+# Bot handlers
+# -----------------------------------------------------------------------------
+@dataclass
+class MediaInfo:
+    filename: str
+    language: Optional[str]  # from caption "lang=uk" | "en" | None
+
+def parse_caption_language(caption: Optional[str]) -> Optional[str]:
+    if not caption: return None
+    for p in caption.split():
+        if p.lower().startswith("lang="):
+            val = p.split("=",1)[1].strip().lower()
+            if val in ("uk","en"): return val
+    return None
+
+async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привіт! Надішли voice/audio/відео або файл — поверну текст.\n"
+        "Можна додати підпис: lang=uk або lang=en.\n"
+        "Після розшифровки з’являться кнопки: Підсумок, Протокол, Переклад, TXT, Субтитри."
     )
 
-
-async def set_actions_loading(query, action: str) -> None:
-    """Edit the reply markup of the message to show a loading indicator.
-
-    Parameters
-    ----------
-    query : telegram.CallbackQuery
-        The callback query associated with the button press.
-    action : str
-        The action being performed ('summary', 'translate', 'txt').
-    """
-    try:
-        await query.edit_message_reply_markup(reply_markup=build_loading_kb(action))
-    except Exception:
-        # If editing fails (e.g. message deleted), ignore
-        pass
-
-
-async def restore_actions_kb(query, transcript_id: str, lang_hint: str) -> None:
-    """Restore the normal inline keyboard after an action completes.
-
-    Parameters
-    ----------
-    query : telegram.CallbackQuery
-        The callback query associated with the button press.
-    transcript_id : str
-        Identifier for the stored transcript.
-    lang_hint : str
-        Language hint for the summary ("uk" or "en").
-    """
-    try:
-        await query.edit_message_reply_markup(
-            reply_markup=build_actions_kb(transcript_id, lang_hint)
-        )
-    except Exception:
-        pass
-
-
-def get_default_settings() -> Dict[str, str]:
-    """Return default settings for a chat.
-
-    The settings dictionary controls how the bot processes audio and presents
-    results.  Keys:
-
-    ``language``: one of ``"auto"``, ``"uk"`` or ``"en"``.  This selects
-        the language Whisper should use when transcribing.  ``"auto"`` lets
-        Whisper auto‑detect.
-
-    ``output``: one of ``"auto"``, ``"text"`` or ``"file"``.  "auto"
-        chooses text for short transcripts and file for long ones.  "text"
-        always sends the transcript in chat; "file" always sends a file.
-
-    ``summary_mode``: one of ``"short"``, ``"long"`` or ``"minutes"``.
-        This determines the default summary type shown after transcription.
-    """
-    return {"language": "auto", "output": "auto", "summary_mode": "short"}
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command.
-
-    Sends a welcome message with sample usage and quick access buttons.
-    """
-    chat_id = update.effective_chat.id
-    # Initialize settings if not present
-    settings = context.chat_data.setdefault("settings", get_default_settings())
-    keyboard = [
-        [
-            InlineKeyboardButton("Налаштування", callback_data="settings_menu"),
-            InlineKeyboardButton("Поради", callback_data="tips_menu"),
-            InlineKeyboardButton("Політика", callback_data="privacy_menu"),
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    text = (
-        "Привіт! Я транскрибую voice/audio/video у текст.\n"
-        "Надішли файл або voice‑повідомлення.\n"
-        "Можна додати підпис lang=uk або lang=en, або обрати мову в налаштуваннях."
-    )
-    await update.message.reply_text(text, reply_markup=reply_markup)
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /help command."""
+async def help_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "/start — привітання\n"
-        "/help — як користуватись\n"
-        "/settings — налаштування (мова, формат виводу)\n"
-        "/privacy — політика приватності\n\n"
-        "Надішли аудіо/voice/відео або файл — отримаєш розшифровку.\n"
-        "Порада: обери мову та формат у /settings."
+        "Надішли аудіо/voice/відео/файл — отримаєш розшифровку.\n"
+        "Порада: додай підпис lang=uk або lang=en.\n"
+        "/settings — налаштування (мова підсумку, тип підсумку за замовчуванням)."
     )
 
+async def show_settings_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    st = context.chat_data.setdefault("settings", dict(DEFAULT_SETTINGS))
+    sm = st.get("summary_mode","short")
+    sm_label = {"short":"короткий", "long":"розширений", "minutes":"протокол"}.get(sm,"короткий")
+    sl = st.get("summary_lang","auto")
+    sl_label = {"auto":"Авто", "uk":"Українська", "en":"English"}[sl]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Мова підсумку: {sl_label}", callback_data="settings:summary_lang:cycle")],
+        [InlineKeyboardButton(f"Формат підсумку: {sm_label}", callback_data="settings:summary_mode:cycle")],
+        [InlineKeyboardButton("Закрити", callback_data="settings:close")],
+    ])
+    await context.bot.send_message(chat_id, "Налаштування", reply_markup=kb)
 
-async def privacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /privacy command."""
-    txt = (
-        "<b>Приватність</b>\n"
-        "Файли зберігаються тимчасово лише для конвертації й видаляються одразу після транскрипції. "
-        "Текст відповіді надсилається в цей чат і ніде більше не публікується."
-    )
-    await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
-
-
-async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /settings command by showing settings menu."""
+async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_settings_menu(update.effective_chat.id, context)
 
-
-async def show_settings_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send an inline keyboard with current settings for language and output."""
-    settings = context.chat_data.setdefault("settings", get_default_settings())
-    lang = settings.get("language", "auto")
-    output = settings.get("output", "auto")
-    summary_mode = settings.get("summary_mode", "short")
-    # Display current selections in button text
-    lang_text = {
-        "auto": "Мова: Авто",
-        "uk": "Мова: Українська",
-        "en": "Мова: English",
-    }[lang]
-    output_text = {
-        "auto": "Формат: Авто",
-        "text": "Формат: Текст",
-        "file": "Формат: Файл",
-    }[output]
-    summary_text = {
-        "short": "Підсумок: короткий",
-        "long": "Підсумок: розширений",
-        "minutes": "Підсумок: протокол",
-    }[summary_mode]
-    keyboard = [
-        [
-            InlineKeyboardButton(lang_text, callback_data="settings_lang"),
-            InlineKeyboardButton(output_text, callback_data="settings_output"),
-        ],
-        [
-            InlineKeyboardButton(summary_text, callback_data="settings_summary"),
-        ],
-        [InlineKeyboardButton("⬅️ Закрити", callback_data="settings_close")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "Налаштування:\n"
-            "• Мова визначає, яку мову Whisper має розпізнати.\n"
-            "• Формат визначає, чи надсилати текст у чат, файл або автоматично.\n"
-            "• Підсумок: короткий, розширений або протокол за замовчуванням."
-        ),
-        reply_markup=reply_markup,
-    )
-
-
-async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Process callback queries originating from the settings menu."""
+async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not query:
-        return
-    data = query.data
-    settings = context.chat_data.setdefault("settings", get_default_settings())
-    # Handle closing settings
-    if data == "settings_close":
-        await query.answer()
-        await query.edit_message_reply_markup(reply_markup=None)
-        return
-    # Toggle language menu
-    if data == "settings_lang":
-        # Show language options
-        keyboard = [
-            [InlineKeyboardButton("Авто", callback_data="set_lang_auto"),
-             InlineKeyboardButton("Українська", callback_data="set_lang_uk"),
-             InlineKeyboardButton("English", callback_data="set_lang_en")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="settings_back")],
-        ]
-        await query.answer()
-        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-    # Toggle output menu
-    if data == "settings_output":
-        keyboard = [
-            [InlineKeyboardButton("Авто", callback_data="set_output_auto"),
-             InlineKeyboardButton("Текст", callback_data="set_output_text"),
-             InlineKeyboardButton("Файл", callback_data="set_output_file")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="settings_back")],
-        ]
-        await query.answer()
-        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-    # Handle back navigation in settings
-    if data == "settings_back":
-        await query.answer()
-        # Re‑render settings menu
-        await query.delete_message()
-        await show_settings_menu(update.effective_chat.id, context)
-        return
-    # Set language or output
-    updated = False
-    if data.startswith("set_lang_"):
-        lang_val = data.split("set_lang_")[1]
-        settings["language"] = lang_val
-        updated = True
-    elif data.startswith("set_output_"):
-        output_val = data.split("set_output_")[1]
-        settings["output"] = output_val
-        updated = True
-    elif data == "settings_summary":
-        # Cycle through summary modes: short -> long -> minutes -> short
-        order = ["short", "long", "minutes"]
-        current = settings.get("summary_mode", "short")
-        next_index = (order.index(current) + 1) % len(order)
-        settings["summary_mode"] = order[next_index]
-        updated = True
-    if updated:
-        context.chat_data["settings"] = settings
-        await query.answer("Збережено ✅")
-        # Return to settings overview
-        await query.delete_message()
-        await show_settings_menu(update.effective_chat.id, context)
-    else:
-        # Unhandled settings callback
-        await query.answer()
-
-
-async def handle_misc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle other callback queries such as summary, translation, and downloads."""
-    query = update.callback_query
-    if not query or not query.data:
-        return
-    data = query.data
-    # Parse the callback data.  Supported formats:
-    #  summary:<mode>:<transcript_id>
-    #  translate:<target>:<transcript_id>
-    #  txt:<transcript_id>
-    parts = data.split(":")
-    action = parts[0] if parts else ""
-    # initialise variables
-    summary_mode = None
-    transcript_id = None
-    target_lang = None
-    if action == "summary" and len(parts) >= 3:
-        summary_mode = parts[1]
-        transcript_id = parts[2]
-    elif action == "translate" and len(parts) >= 3:
-        target_lang = parts[1]
-        transcript_id = parts[2]
-    elif action == "txt" and len(parts) >= 2:
-        transcript_id = parts[1]
-    else:
-        # Fallback; treat the old format summary:id:lang
-        if action == "summary" and len(parts) >= 2:
-            transcript_id = parts[1]
-            lang_hint = parts[2] if len(parts) > 2 else None
-        elif action == "translate" and len(parts) >= 2:
-            transcript_id = parts[1]
-            target_lang = parts[2] if len(parts) > 2 else None
-        elif action == "txt" and len(parts) >= 2:
-            transcript_id = parts[1]
-        else:
-            # Unknown pattern
-            await query.answer()
-            return
-    # If this is a no‑op button, just acknowledge and return
-    if action == "noop":
-        await query.answer("Обробляю…", show_alert=False)
-        return
-    # Retrieve the transcript text
-    transcripts: Dict[str, str] = context.chat_data.get("transcripts", {})
-    text = transcripts.get(transcript_id or "")
-    if not text:
-        await query.answer("Текст не знайдено", show_alert=True)
-        return
-    # Determine language hint from context
-    last_lang = context.chat_data.get("last_transcript_lang", "uk")
-    # Summary actions (short, long, minutes)
-    if action == "summary":
-        # Determine mode: use provided or default from settings
-        mode = summary_mode or context.chat_data.get("settings", {}).get("summary_mode", "short")
-        # Determine target language: based on last transcript lang or hint
-        target = "uk" if last_lang.startswith("uk") else "en"
-        # Provide immediate feedback
-        await query.answer("Готую підсумок…", show_alert=False)
-        chat_id = query.message.chat_id
-        with suppress(Exception):
-            await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-        # Show loading spinner with label depending on mode
-        if mode == "long":
-            load_label = "Підсумок (розширений)…"
-        elif mode == "minutes":
-            load_label = "Протокол…"
-        else:
-            load_label = "Підсумок…"
-        await query.edit_message_reply_markup(reply_markup=build_loading_kb(load_label))
-        # Generate the summary in desired mode
-        summary_text = await generate_summary_mode(text, mode, target)
-        # Restore keyboard
-        await query.edit_message_reply_markup(reply_markup=build_actions_kb(transcript_id, target))
-        # Convert the summary to Telegram‑friendly HTML and send it.  Long messages are split into chunks.
-        title_map = {
-            "long": "Підсумок (розширений)",
-            "short": "Підсумок (короткий)",
-            "minutes": "Протокол",
-        }
-        html_body = summary_to_html(summary_text)
-        full_html = f"<b>{title_map.get(mode, 'Підсумок')}</b>\n{html_body}"
-        await send_long_html(chat_id, full_html, context)
-        return
-    # Handle translation action
-    if action == "translate":
-        # Determine the target language from callback or default toggled
-        target = target_lang or ("en" if last_lang.startswith("uk") else "uk")
-        await query.answer("Готую переклад…", show_alert=False)
-        chat_id = query.message.chat_id
-        with suppress(Exception):
-            await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-        # Loading indicator
-        await query.edit_message_reply_markup(reply_markup=build_loading_kb("Переклад…"))
-        translation_text = await translate_text(text, target)
-        # After translation, restore keyboard with summary language hint (opposite of target)
-        new_lang = "uk" if target.lower().startswith("en") else "en"
-        await query.edit_message_reply_markup(reply_markup=build_actions_kb(transcript_id, new_lang))
-        await context.bot.send_message(
-            chat_id,
-            f"<b>Переклад ({target})</b>\n{translation_text}",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    # Handle TXT download
-    if action == "txt":
-        await query.answer("Готую файл…", show_alert=False)
-        chat_id = query.message.chat_id
-        with suppress(Exception):
-            await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
-        await query.edit_message_reply_markup(reply_markup=build_loading_kb("TXT…"))
-        bio = BytesIO(text.encode("utf-8"))
-        bio.name = "transcript.txt"
-        await query.message.reply_document(document=InputFile(bio), caption="transcript.txt")
-        # Restore keyboard (use stored last transcript language)
-        await query.edit_message_reply_markup(reply_markup=build_actions_kb(transcript_id, last_lang))
-        return
-    # Unknown actions
     await query.answer()
+    parts = query.data.split(":")  # settings:key:action
+    if len(parts) < 3:
+        return
+    _, key, action = parts
+    st = context.chat_data.setdefault("settings", dict(DEFAULT_SETTINGS))
+    if key == "summary_lang" and action == "cycle":
+        order = ["auto","uk","en"]
+        cur = st.get("summary_lang","auto")
+        st["summary_lang"] = order[(order.index(cur)+1) % len(order)]
+    elif key == "summary_mode" and action == "cycle":
+        order = ["short","long","minutes"]
+        cur = st.get("summary_mode","short")
+        st["summary_mode"] = order[(order.index(cur)+1) % len(order)]
+    elif key == "close":
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+        return
+    await query.edit_message_reply_markup(reply_markup=None)
+    await show_settings_menu(update.effective_chat.id, context)
 
+# -----------------------------------------------------------------------------
+# Media handling
+# -----------------------------------------------------------------------------
+AUDIO_FILTER = (
+    filters.VOICE | filters.AUDIO | filters.VIDEO |
+    filters.Document.AUDIO |
+    filters.Document.MimeType("audio/") | filters.Document.MimeType("video/") |
+    filters.Document.FileExtension("m4a") | filters.Document.FileExtension("mp3") |
+    filters.Document.FileExtension("wav") | filters.Document.FileExtension("ogg") |
+    filters.Document.FileExtension("oga") | filters.Document.FileExtension("opus") |
+    filters.Document.FileExtension("flac")| filters.Document.FileExtension("aac") |
+    filters.Document.FileExtension("wma") | filters.Document.FileExtension("mkv") |
+    filters.Document.FileExtension("mp4") | filters.Document.FileExtension("mov")
+)
 
-async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Process incoming media messages, compress audio and transcribe."""
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
         return
-    chat_id = msg.chat_id
-    # Send immediate feedback to show processing has started
-    with suppress(Exception):
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        status_msg = await msg.reply_text("Прийняв 🎧 Обробляю…", quote=True)
+    await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+
+    # determine file & name
     file = None
     filename = "input"
-    try:
-        if msg.voice:
-            file = await msg.voice.get_file()
-            filename = "voice.ogg"
-        elif msg.audio:
-            file = await msg.audio.get_file()
-            filename = msg.audio.file_name or "audio.bin"
-        elif msg.video:
-            file = await msg.video.get_file()
-            filename = msg.video.file_name or "video.mp4"
-        elif msg.document:
-            file = await msg.document.get_file()
-            filename = msg.document.file_name or "file.bin"
-        else:
-            await msg.reply_text("Надішліть аудіо/voice/відео/файл.")
-            return
-    except Exception as e:
-        log.exception("get_file failed")
-        await msg.reply_text(f"Не вдалося отримати файл: {e}")
+    if msg.voice:
+        file = await msg.voice.get_file()
+        filename = "voice.ogg"
+    elif msg.audio:
+        file = await msg.audio.get_file()
+        filename = msg.audio.file_name or "audio.bin"
+    elif msg.video:
+        file = await msg.video.get_file()
+        filename = msg.video.file_name or "video.mp4"
+    elif msg.document:
+        file = await msg.document.get_file()
+        filename = msg.document.file_name or "file.bin"
+    else:
+        await msg.reply_text("Надішліть аудіо/voice/відео/файл.")
         return
-    # Read language from caption or settings
-    language: Optional[str] = None
-    # Check caption for lang=
-    if msg.caption:
-        for p in msg.caption.split():
-            if p.lower().startswith("lang="):
-                language = p.split("=", 1)[1].strip() or None
-    # Override with settings if not specified
-    settings = context.chat_data.setdefault("settings", get_default_settings())
-    lang_pref = settings.get("language", "auto")
-    if language is None and lang_pref != "auto":
-        language = lang_pref
-    # File size guard
-    try:
-        fsize = getattr(file, "file_size", None)
-        if fsize and fsize > MAX_FILE_BYTES:
-            await msg.reply_text(
-                f"Файл завеликий ({human_size(fsize)}). Обмеження {human_size(MAX_FILE_BYTES)}."
-            )
-            return
-    except Exception:
-        pass
+
+    language = parse_caption_language(msg.caption)  # None/uk/en
+
+    if file.file_size and file.file_size > MAX_API_FILE_BYTES * 8:  # soft limit to avoid giant videos
+        await msg.reply_text(f"Файл надто великий ({human_size(file.file_size)}). Надішліть, будь ласка, менший.")
+        return
+
     with tempfile.TemporaryDirectory() as td:
-        td_path = Path(td)
-        src = td_path / filename
-        compressed = td_path / "compressed.mp3"
+        td = Path(td)
+        src = td / filename
+        await file.download_to_drive(custom_path=str(src))
+
+        # Convert to wav first to stabilise stream, then compress to ogg under limit
+        wav = td / TMP_WAV
         try:
-            await file.download_to_drive(custom_path=str(src))
-            log.info("Downloaded to %s", src)
-        except Exception as e:
-            log.exception("download_to_drive failed")
-            await msg.reply_text(f"Помилка завантаження файлу: {e}")
+            run_ffmpeg_to_wav(src, wav, sr=AUDIO_SR)
+        except subprocess.CalledProcessError:
+            await msg.reply_text("Не вдалося обробити аудіо через ffmpeg.")
             return
-        # Progressive compression using bitrate ladder
-        success = False
-        for bitrate in BITRATE_LADDER:
-            try:
-                run_ffmpeg_to_mp3(src, compressed, sr=TARGET_SR, bitrate=bitrate)
-            except subprocess.CalledProcessError:
-                await msg.reply_text("Не вдалося обробити аудіо через ffmpeg.")
-                return
-            except FileNotFoundError:
-                await msg.reply_text(
-                    "ffmpeg не знайдено на сервері. Перевір конфігурацію деплою."
-                )
-                return
-            if compressed.stat().st_size <= MAX_API_FILE_BYTES:
-                success = True
-                break
-        if not success:
-            await msg.reply_text(
-                "Аудіо занадто довге або не вдається стиснути до допустимого розміру (25 МБ). "
-                "Спробуйте надіслати коротший або більш стиснутий файл."
-            )
-            return
-        # Transcribe
+
+        candidate = ensure_under_limit(wav)
+        # Transcribe (verbose)
         try:
-            text = await transcribe_audio(compressed, language)
+            result = await asyncio.to_thread(transcribe_verbose, candidate, language)
         except Exception as e:
-            log.exception("transcribe failed")
             await msg.reply_text(f"Помилка транскрипції: {e}")
             return
-        text = (text or "").strip()
+
+        text = (result.get("text") or "").strip()
         if not text:
-            await msg.reply_text(
-                "Не вдалось розпізнати мовлення (порожній результат)."
-            )
+            await msg.reply_text("Не вдалось розпізнати мовлення (порожній результат).")
             return
-        # Store transcript for later actions
-        transcripts: Dict[str, str] = context.chat_data.setdefault(
-            "transcripts", {}
-        )
+
+        # Store transcript + words
+        transcripts: Dict[str, str] = context.chat_data.setdefault("transcripts", {})
+        words_map: Dict[str, List[Dict]] = context.chat_data.setdefault("transcript_words", {})
         transcript_id = uuid.uuid4().hex
         transcripts[transcript_id] = text
+        words_map[transcript_id] = result.get("words") or []
         context.chat_data["transcripts"] = transcripts
-        # Persist the last transcript text and language for summary/translation hints
-        # Determine the language of the transcript: use explicit language if set,
-        # otherwise guess based on presence of Cyrillic characters in the text.
-        if language:
-            transcript_lang = language.lower()
-        else:
-            transcript_lang = (
-                "uk"
-                if any("а" <= c.lower() <= "я" for c in text[:200])
-                else "en"
-            )
-        context.chat_data["last_transcript_text"] = text
-        context.chat_data["last_transcript_lang"] = transcript_lang
-        # Determine output preference
-        output_pref = settings.get("output", "auto")
-        # Determine if file output is needed
-        use_file = False
-        if output_pref == "file":
-            use_file = True
-        elif output_pref == "text":
-            use_file = False
-        else:
-            # auto: if text too long use file
-            use_file = len(text) > 3500
-        # Compute summary language hint for buttons (use transcript language)
-        lang_hint = "uk" if transcript_lang.startswith("uk") else "en"
-        # Build inline keyboard with hints
-        reply_markup = build_actions_kb(transcript_id, lang_hint)
-        if use_file:
-            bio = BytesIO(text.encode("utf-8"))
-            bio.name = "transcript.txt"
-            caption = "Розшифровка"
+        context.chat_data["transcript_words"] = words_map
+
+        # Language hint
+        lang_hint = "uk"
+        lang_det = result.get("lang")
+        if lang_det:
+            lang_hint = "uk" if str(lang_det).lower().startswith("uk") else "en"
+        context.chat_data["last_transcript_lang"] = lang_hint
+        context.chat_data["last_lang_hint"] = lang_hint
+
+        # Send text or file depending on length
+        if len(text) > 3500:
+            txt = td / "transcript.txt"
+            txt.write_text(text, encoding="utf-8")
             await msg.reply_document(
-                document=InputFile(bio), caption=caption, reply_markup=reply_markup
+                document=InputFile(str(txt), filename="transcript.txt"),
+                caption="Розшифровка",
+                reply_markup=build_actions_kb(transcript_id, lang_hint)
             )
         else:
-            await msg.reply_text(text, reply_markup=reply_markup)
-        # Delete status message if it exists
-        with suppress(Exception):
-            await status_msg.delete()
+            await msg.reply_text(text, reply_markup=build_actions_kb(transcript_id, lang_hint))
 
-
-async def tips_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send some helpful tips when user presses the tips button."""
+# -----------------------------------------------------------------------------
+# Callback handling
+# -----------------------------------------------------------------------------
+async def handle_misc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query:
+    data = query.data
+    if data == "noop":
+        return await query.answer("Обробляю…")
+    if data.startswith("settings:"):
+        return await handle_settings_callback(update, context)
+
+    parts = data.split(":")
+    action = parts[0]
+    chat_id = update.effective_chat.id
+    transcripts: Dict[str, str] = context.chat_data.get("transcripts", {})
+    words_map: Dict[str, List[Dict]] = context.chat_data.get("transcript_words", {})
+    lang_hint = context.chat_data.get("last_lang_hint", "uk")
+
+    if action == "summary":
+        # summary:<mode>:<tid>
+        mode = parts[1]; tid = parts[2]
+        text = transcripts.get(tid, "")
+        if not text:
+            return await query.answer("Немає тексту для підсумку", show_alert=True)
+        await query.answer("Готую підсумок…")
+        await query.edit_message_reply_markup(reply_markup=build_loading_kb(
+            "Підсумок (розширений…)" if mode=="long" else "Протокол…" if mode=="minutes" else "Підсумок…"
+        ))
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        st = context.chat_data.get("settings", DEFAULT_SETTINGS)
+        target = pick_output_lang(context.chat_data.get("last_transcript_lang"), st)
+        summary = await generate_summary_mode(text, mode, target)
+        title = "Підсумок (long)" if mode=="long" else ("Протокол" if mode=="minutes" else "Підсумок (short)")
+        html_out = f"<b>{title}</b>\n{summary}"
+        await send_long_html(chat_id, html_out, context)
+        await query.edit_message_reply_markup(reply_markup=build_actions_kb(tid, target))
+        return
+
+    if action == "translate":
+        # translate:<lang>:<tid>  — reserved hook; can implement LLM translation if needed
+        await query.answer("Поки не реалізовано переклад у цій збірці", show_alert=True)
+        return
+
+    if action == "export_txt":
+        tid = parts[1]
+        text = transcripts.get(tid, "")
+        if not text:
+            return await query.answer("Немає тексту", show_alert=True)
+        await query.answer("Генерую TXT…")
+        await query.edit_message_reply_markup(reply_markup=build_loading_kb("TXT…"))
+        from io import BytesIO
+        bio = BytesIO(text.encode("utf-8")); bio.name = "transcript.txt"
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+        await context.bot.send_document(chat_id, document=InputFile(bio), caption="Транскрипт (TXT)")
+        await query.edit_message_reply_markup(reply_markup=build_actions_kb(tid, lang_hint))
+        return
+
+    if action == "subtitle":
+        tid = parts[1]
+        if not words_map.get(tid):
+            return await query.answer("Немає таймкодів для цього запису", show_alert=True)
+        await query.answer("Скільки слів на таймкод?")
+        await query.edit_message_reply_markup(reply_markup=build_subtitles_wpc_kb(tid))
+        return
+
+    if action == "subtitle_wpc":
+        n = int(parts[1]); tid = parts[2]
+        words = words_map.get(tid, [])
+        if not words:
+            return await query.answer("Немає таймкодів", show_alert=True)
+        await query.answer("Генерую SRT…")
+        await query.edit_message_reply_markup(reply_markup=build_loading_kb("Субтитри…"))
+        srt = make_srt_from_words(words, n)
+        from io import BytesIO
+        bio = BytesIO(srt.encode("utf-8")); bio.name = f"subtitles_{n}w.srt"
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+        await context.bot.send_document(chat_id, document=InputFile(bio), caption=f"Субтитри ({n} слів/таймкод)")
+        await query.edit_message_reply_markup(reply_markup=build_actions_kb(tid, lang_hint))
+        return
+
+    if action == "subtitle_custom":
+        tid = parts[1]
+        context.chat_data["awaiting_wpc_for"] = tid
         await query.answer()
-        await query.message.reply_text(
-            "Поради:\n"
-            "• Додавай lang=uk або lang=en у підписі до повідомлення.\n"
-            "• У Налаштуваннях можна змінити мову та формат.\n"
-            "• Щоб отримати підсумок або переклад, натисни відповідні кнопки після розшифровки."
-        )
+        await context.bot.send_message(chat_id, "Введи кількість слів на таймкод (1–30):")
+        return
 
+async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+    tid = context.chat_data.get("awaiting_wpc_for")
+    if not tid:
+        return
+    try:
+        n = int(msg.text.strip())
+        if not (1 <= n <= 30):
+            raise ValueError
+    except Exception:
+        await msg.reply_text("Будь ласка, введи число від 1 до 30.")
+        return
+    words_map: Dict[str, List[Dict]] = context.chat_data.get("transcript_words", {})
+    words = words_map.get(tid, [])
+    if not words:
+        await msg.reply_text("Немає таймкодів для цього запису.")
+        context.chat_data.pop("awaiting_wpc_for", None)
+        return
+    from io import BytesIO
+    srt = make_srt_from_words(words, n)
+    bio = BytesIO(srt.encode("utf-8")); bio.name = f"subtitles_{n}w.srt"
+    await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+    await msg.reply_document(document=InputFile(bio), caption=f"Субтитри ({n} слів/таймкод)")
+    context.chat_data.pop("awaiting_wpc_for", None)
 
-async def button_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Dispatch callback queries to appropriate handlers based on prefix."""
-    data = update.callback_query.data if update.callback_query else ""
-    if data.startswith("settings") or data.startswith("set_"):
-        await handle_settings_callback(update, context)
-    elif data.startswith("summary") or data.startswith("translate") or data.startswith("txt"):
-        await handle_misc_callback(update, context)
-    elif data == "tips_menu":
-        await tips_callback(update, context)
-    elif data == "privacy_menu":
-        await privacy(update.callback_query, context)
-    elif data == "settings_menu":
-        await settings_cmd(update.callback_query, context)
-    else:
-        await update.callback_query.answer()
-
-
-def main() -> None:
-    """Start the Telegram bot application."""
+# -----------------------------------------------------------------------------
+# Wiring & main
+# -----------------------------------------------------------------------------
+def build_application() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    # Command handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("settings", settings_cmd))
-    app.add_handler(CommandHandler("privacy", privacy))
-    # Message handler for media
-    AUDIO_FILTER = (
-        filters.VOICE
-        | filters.AUDIO
-        | filters.VIDEO
-        | filters.Document.AUDIO
-        | filters.Document.MimeType("audio/")
-        | filters.Document.MimeType("video/")
-        | filters.Document.FileExtension("m4a")
-        | filters.Document.FileExtension("mp3")
-        | filters.Document.FileExtension("wav")
-        | filters.Document.FileExtension("ogg")
-        | filters.Document.FileExtension("oga")
-        | filters.Document.FileExtension("opus")
-        | filters.Document.FileExtension("flac")
-        | filters.Document.FileExtension("aac")
-        | filters.Document.FileExtension("wma")
-        | filters.Document.FileExtension("mkv")
-        | filters.Document.FileExtension("mp4")
-        | filters.Document.FileExtension("mov")
-    )
+    app.add_handler(CallbackQueryHandler(handle_misc_callback))
+    # media + plain text
     app.add_handler(MessageHandler(AUDIO_FILTER, handle_media))
-    # Callback query handler
-    app.add_handler(CallbackQueryHandler(button_dispatcher))
-    # Run the bot
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_plain_text))
+    return app
 
+def main():
+    app = build_application()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
